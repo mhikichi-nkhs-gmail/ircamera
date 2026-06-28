@@ -1,0 +1,9 @@
+.venv/
+calibration.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.DS_Store
