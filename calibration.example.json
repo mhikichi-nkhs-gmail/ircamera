@@ -5,11 +5,15 @@
     [2000.0, 1500.0],
     [100.0, 1500.0]
   ],
-  "osc_ip": "192.168.1.100",
+  "osc_ip": "192.168.247.135",
   "osc_port": 9000,
   "osc_queue_fps": 10.0,
   "osc_click_gap_ms": 50.0,
   "projection_aspect": 1.7778,
   "peripheral_margin": 0.1,
-  "peripheral_event_interval_s": 1.0
+  "peripheral_event_interval_s": 1.0,
+  "stream_fps": 15.0,
+  "stream_width": 640,
+  "stream_height": 240,
+  "jpeg_quality": 50
 }

@@ -50,10 +50,16 @@ SERVER_HOST = ""
 SERVER_PORT = 12345
 JPEG_QUALITY = 70
 
+# Stream output defaults (can be overridden via calibration.json)
+_DEFAULT_STREAM_FPS = 15.0
+_DEFAULT_STREAM_WIDTH = 640
+_DEFAULT_STREAM_HEIGHT = 240
+_DEFAULT_JPEG_QUALITY = 50
+
 CALIB_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
 
 # Default OSC/network settings.  These can be overridden by calibration.json.
-_DEFAULT_OSC_IP = "192.168.1.100"
+_DEFAULT_OSC_IP = "192.168.1.106"
 _DEFAULT_OSC_PORT = 9000
 _DEFAULT_OSC_QUEUE_FPS = 10.0
 _DEFAULT_OSC_CLICK_GAP_MS = 50.0
@@ -72,6 +78,10 @@ def _load_config() -> dict:
         "projection_aspect": _DEFAULT_PROJECTION_ASPECT,
         "peripheral_margin": _DEFAULT_PERIPHERAL_MARGIN,
         "peripheral_event_interval_s": _DEFAULT_PERIPHERAL_EVENT_INTERVAL_S,
+        "stream_fps": _DEFAULT_STREAM_FPS,
+        "stream_width": _DEFAULT_STREAM_WIDTH,
+        "stream_height": _DEFAULT_STREAM_HEIGHT,
+        "jpeg_quality": _DEFAULT_JPEG_QUALITY,
     }
     if not os.path.exists(CALIB_FILE):
         return defaults
@@ -98,6 +108,11 @@ OSC_CLICK_GAP_S = float(_CONFIG["osc_click_gap_ms"]) / 1000.0
 PROJECTION_ASPECT = float(_CONFIG["projection_aspect"])
 PERIPHERAL_MARGIN = float(_CONFIG["peripheral_margin"])
 PERIPHERAL_EVENT_INTERVAL_S = float(_CONFIG["peripheral_event_interval_s"])
+STREAM_FPS = float(_CONFIG["stream_fps"])
+STREAM_INTERVAL_S = 1.0 / STREAM_FPS
+STREAM_WIDTH = int(_CONFIG["stream_width"])
+STREAM_HEIGHT = int(_CONFIG["stream_height"])
+STREAM_JPEG_QUALITY = int(_CONFIG["jpeg_quality"])
 
 
 # ---------------------------------------------------------------------------
@@ -469,8 +484,8 @@ def main() -> None:
     # Track the last time a peripheral event was sent per touch id.
     peripheral_last_sent: dict[int, float] = {}
 
-    # OSC outbound queue: touch state messages are queued here and flushed at
-    # OSC_QUEUE_FPS.  Each message is [is_active, x, y].
+    # OSC outbound queue: flushed at OSC_QUEUE_FPS.
+    # Each touch appends a (1, tx, ty) then (0, tx, ty) pair.
     osc_queue: list[tuple[int, float, float]] = []
     osc_last_flush = 0.0
     osc_was_active = False
@@ -493,8 +508,8 @@ def main() -> None:
     camera.configure(config)
     camera.start()
 
-    half_width = PREVIEW_WIDTH // 2
-    display_size = (half_width, PREVIEW_HEIGHT)
+    half_width = STREAM_WIDTH // 2
+    display_size = (half_width, STREAM_HEIGHT)
 
     # Store sizes on state so the client handler can convert coordinates.
     state.display_size = display_size
@@ -520,6 +535,7 @@ def main() -> None:
     try:
         H_warp_cached = None
         calib_src_cached = None
+        stream_last_sent = 0.0
 
         while state.running:
             frame = camera.capture_array()
@@ -546,8 +562,8 @@ def main() -> None:
                     if calib_src is not None else None
                 )
 
+            now = time.monotonic()
             if centroids:
-                now = time.monotonic()
                 objects = []
                 for idx, (cx, cy, area) in enumerate(centroids, start=1):
                     obj = {"x": int(cx), "y": int(cy), "area": float(area)}
@@ -587,8 +603,9 @@ def main() -> None:
                                 continue
                             peripheral_last_sent[idx] = now
 
-                        print(f"[OSC] queue /touch active=1 tx={tx} ty={ty} (nx={nx}, ny={ny})")
+                        print(f"[OSC] queue /touch tx={tx} ty={ty} (nx={nx}, ny={ny})")
                         osc_queue.append((1, tx, ty))
+                        osc_queue.append((0, tx, ty))
                         osc_was_active = True
                     objects.append(obj)
                 payload = {
@@ -602,39 +619,49 @@ def main() -> None:
                 sys.stdout.flush()
 
             # Flush queued OSC messages at the configured rate.
-            # Each queued touch is emitted as a discrete click sequence:
-            # [1, x, y] followed after OSC_CLICK_GAP_S by [0, x, y].
+            # Each touch is a (1,x,y)/(0,x,y) pair; send 1, wait, send 0.
             if now - osc_last_flush >= OSC_QUEUE_INTERVAL_S:
                 osc_last_flush = now
                 if osc_queue:
-                    for is_active, tx, ty in osc_queue:
-                        osc_client.send_message("/touch", [1, tx, ty])
+                    it = iter(osc_queue)
+                    for msg_on, msg_off in zip(it, it):
+                        _, tx_on, ty_on = msg_on
+                        _, tx_off, ty_off = msg_off
+                        osc_client.send_message("/touch", [1, tx_on, ty_on])
                         time.sleep(OSC_CLICK_GAP_S)
-                        osc_client.send_message("/touch", [0, tx, ty])
-                    print(f"[OSC] flushed {len(osc_queue)} click sequence(s)")
+                        osc_client.send_message("/touch", [0, tx_off, ty_off])
+                    print(f"[OSC] flushed {len(osc_queue) // 2} touch(es)")
                     osc_queue.clear()
                     osc_was_active = True
+                elif osc_was_active:
+                    osc_client.send_message("/touch", [0, 0.0, 0.0])
+                    print("[OSC] idle: sent active=0")
+                    osc_was_active = False
 
-            preview = build_preview(
-                frame, binary, centroids, display_size,
-                threshold_value, blur_kernel, min_area, invert, calib_src,
-                cap_size=max_size, H_warp=H_warp_cached,
-            )
+            if now - stream_last_sent >= STREAM_INTERVAL_S:
+                stream_last_sent = now
+                preview = build_preview(
+                    frame, binary, centroids, display_size,
+                    threshold_value, blur_kernel, min_area, invert, calib_src,
+                    cap_size=max_size, H_warp=H_warp_cached,
+                )
 
-            ok, encoded = cv2.imencode(
-                ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-            )
-            if ok:
-                jpeg_bytes = encoded.tobytes()
-                with client_ref[1]:
-                    conn = client_ref[0]
-                if conn is not None:
-                    if not send_frame(conn, jpeg_bytes):
-                        with client_ref[1]:
-                            client_ref[0] = None
+                ok, encoded = cv2.imencode(
+                    ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_JPEG_QUALITY]
+                )
+                if ok:
+                    jpeg_bytes = encoded.tobytes()
+                    with client_ref[1]:
+                        conn = client_ref[0]
+                    if conn is not None:
+                        if not send_frame(conn, jpeg_bytes):
+                            with client_ref[1]:
+                                client_ref[0] = None
+
+                if show_gui:
+                    cv2.imshow("NoIR Camera: original | binary", preview)
 
             if show_gui:
-                cv2.imshow("NoIR Camera: original | binary", preview)
                 key = cv2.waitKey(1) & 0xFF
             else:
                 key = 0xFF
